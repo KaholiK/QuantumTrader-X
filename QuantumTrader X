@@ -1,0 +1,1161 @@
+import os
+import logging
+import requests
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Global Configuration
+class Config:
+    RITHMIC_USERNAME = os.getenv("RITHMIC_USERNAME")
+    RITHMIC_PASSWORD = os.getenv("RITHMIC_PASSWORD")
+    COINBASE_API_KEY = os.getenv("COINBASE_API_KEY")
+    COINBASE_SECRET_KEY = os.getenv("COINBASE_SECRET_KEY")
+    RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.01))  # Default: 1% risk per trade
+    MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", 0.05))  # Default: 5% max daily loss
+    LOG_FILE = "trading_bot.log"
+    API_TIMEOUT = 10  # Timeout for API requests
+
+# Logging Configuration
+logging.basicConfig(
+    filename=Config.LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# API Integrations
+class RithmicAPI:
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+        self.base_url = "https://api.rithmic.com"  # Replace with actual Rithmic API endpoint
+        self.session = requests.Session()
+
+    def authenticate(self):
+        try:
+            response = self.session.post(
+                f"{self.base_url}/auth",
+                json={"username": self.username, "password": self.password},
+                timeout=Config.API_TIMEOUT
+            )
+            response.raise_for_status()
+            logging.info("Authenticated with Rithmic API successfully.")
+            return response.json().get("token")
+        except Exception as e:
+            logging.error(f"Error authenticating with Rithmic API: {e}")
+            return None
+
+class CoinbaseAPI:
+    def __init__(self, api_key, secret_key):
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.base_url = "https://api.exchange.coinbase.com"
+        self.session = requests.Session()
+
+    def authenticate(self):
+        try:
+            # Coinbase doesn't require explicit authentication for public endpoints
+            logging.info("Coinbase API key loaded successfully.")
+        except Exception as e:
+            logging.error(f"Error initializing Coinbase API: {e}")
+
+# Initialize APIs
+def initialize_apis():
+    rithmic = RithmicAPI(Config.RITHMIC_USERNAME, Config.RITHMIC_PASSWORD)
+    coinbase = CoinbaseAPI(Config.COINBASE_API_KEY, Config.COINBASE_SECRET_KEY)
+
+    # Authenticate Rithmic API
+    rithmic_token = rithmic.authenticate()
+    if not rithmic_token:
+        logging.error("Failed to authenticate with Rithmic. Exiting...")
+        exit(1)
+
+    # Coinbase doesn't need explicit authentication for public endpoints
+    coinbase.authenticate()
+
+    return rithmic, coinbase
+
+# Initialize Bot
+def initialize_bot():
+    logging.info("Initializing trading bot...")
+    # Load APIs
+    rithmic, coinbase = initialize_apis()
+
+    # Print configuration
+    logging.info(f"Risk per trade: {Config.RISK_PER_TRADE}")
+    logging.info(f"Max daily loss: {Config.MAX_DAILY_LOSS}")
+    logging.info("Trading bot initialized successfully.")
+
+    return rithmic, coinbase
+
+# Entry Point
+if __name__ == "__main__":
+    rithmic_api, coinbase_api = initialize_bot()
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import logging
+
+# Data Pipeline Configuration
+class DataPipelineConfig:
+    FETCH_INTERVAL = 60  # Fetch live data every 60 seconds
+    HISTORICAL_DAYS = 365  # Fetch 1 year of historical data
+    COINBASE_BASE_URL = "https://api.exchange.coinbase.com"
+
+# Data Fetcher
+class DataFetcher:
+    def __init__(self, coinbase_api):
+        self.coinbase_api = coinbase_api
+
+    def fetch_historical_data(self, product_id="BTC-USD", days=DataPipelineConfig.HISTORICAL_DAYS):
+        """
+        Fetch historical candle data from Coinbase API.
+        """
+        end = datetime.utcnow()
+        start = end - timedelta(days=days)
+
+        # Prepare API request
+        url = f"{DataPipelineConfig.COINBASE_BASE_URL}/products/{product_id}/candles"
+        params = {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "granularity": 3600  # Hourly candles
+        }
+
+        try:
+            response = self.coinbase_api.session.get(url, params=params)
+            response.raise_for_status()
+            candles = response.json()
+
+            # Convert to DataFrame
+            df = pd.DataFrame(
+                candles, columns=["time", "low", "high", "open", "close", "volume"]
+            )
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+            df.set_index("time", inplace=True)
+            df.sort_index(inplace=True)
+
+            logging.info(f"Fetched historical data for {product_id} from {start} to {end}.")
+            return df
+        except Exception as e:
+            logging.error(f"Failed to fetch historical data: {e}")
+            return pd.DataFrame()
+
+    def fetch_live_data(self, product_id="BTC-USD"):
+        """
+        Fetch the latest price from Coinbase API.
+        """
+        url = f"{DataPipelineConfig.COINBASE_BASE_URL}/products/{product_id}/ticker"
+        try:
+            response = self.coinbase_api.session.get(url)
+            response.raise_for_status()
+            ticker = response.json()
+            logging.info(f"Fetched live price for {product_id}: {ticker['price']}")
+            return float(ticker["price"])
+        except Exception as e:
+            logging.error(f"Failed to fetch live data: {e}")
+            return None
+
+# Data Preprocessor
+class DataPreprocessor:
+    @staticmethod
+    def add_technical_indicators(df):
+        """
+        Add technical indicators to the DataFrame.
+        """
+        try:
+            df["SMA_50"] = df["close"].rolling(window=50).mean()
+            df["SMA_200"] = df["close"].rolling(window=200).mean()
+            df["RSI"] = DataPreprocessor.calculate_rsi(df["close"])
+            logging.info("Technical indicators added to data.")
+            return df
+        except Exception as e:
+            logging.error(f"Error in adding technical indicators: {e}")
+            return df
+
+    @staticmethod
+    def calculate_rsi(series, period=14):
+        """
+        Calculate Relative Strength Index (RSI).
+        """
+        delta = series.diff(1)
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+
+        avg_gain = pd.Series(gain).rolling(window=period).mean()
+        avg_loss = pd.Series(loss).rolling(window=period).mean()
+
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    @staticmethod
+    def normalize_data(df):
+        """
+        Normalize data for model input.
+        """
+        normalized_df = (df - df.min()) / (df.max() - df.min())
+        logging.info("Data normalized for model input.")
+        return normalized_df
+
+# Testing the Data Pipeline
+if __name__ == "__main__":
+    # Assume Coinbase API is initialized from the previous part
+    from part1_core_setup import CoinbaseAPI, Config
+    coinbase_api = CoinbaseAPI(Config.COINBASE_API_KEY, Config.COINBASE_SECRET_KEY)
+
+    fetcher = DataFetcher(coinbase_api)
+    preprocessor = DataPreprocessor()
+
+    # Fetch and preprocess historical data
+    historical_data = fetcher.fetch_historical_data(product_id="BTC-USD")
+    if not historical_data.empty:
+        processed_data = preprocessor.add_technical_indicators(historical_data)
+        normalized_data = preprocessor.normalize_data(processed_data)
+        print(normalized_data.head())
+
+    # Fetch live data
+    live_price = fetcher.fetch_live_data(product_id="BTC-USD")
+    print(f"Live Price: {live_price}")
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+import tensorflow as tf
+import logging
+import joblib  # For saving/loading the model
+
+# AI Configuration
+class AIConfig:
+    MODEL_PATH = "ai_trading_model.pkl"
+    FEATURES = ["close", "SMA_50", "SMA_200", "RSI"]  # Features to use
+    TARGET = "signal"  # Target column (buy/sell/hold signal)
+    THRESHOLD_BUY = 0.7  # Confidence threshold for buy
+    THRESHOLD_SELL = 0.3  # Confidence threshold for sell
+
+# AI Model
+class AIModel:
+    def __init__(self):
+        self.model = None
+
+    def load_or_train_model(self, df):
+        """
+        Load a pre-trained model or train a new one.
+        """
+        try:
+            # Try to load the pre-trained model
+            self.model = joblib.load(AIConfig.MODEL_PATH)
+            logging.info("Loaded pre-trained AI model.")
+        except FileNotFoundError:
+            logging.info("No pre-trained model found. Training a new model.")
+            self.model = self.train_model(df)
+            joblib.dump(self.model, AIConfig.MODEL_PATH)
+            logging.info(f"Model trained and saved to {AIConfig.MODEL_PATH}.")
+
+    def train_model(self, df):
+        """
+        Train a new AI model using the provided DataFrame.
+        """
+        # Prepare data
+        df = df.dropna()  # Drop rows with NaNs
+        X = df[AIConfig.FEATURES]
+        y = df[AIConfig.TARGET]
+
+        # Split into training and testing sets
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Use RandomForest for simplicity (can replace with more complex models later)
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        model.fit(X_train, y_train)
+
+        # Evaluate model
+        predictions = model.predict(X_test)
+        accuracy = accuracy_score(y_test, predictions)
+        logging.info(f"Model trained with accuracy: {accuracy:.2f}")
+
+        return model
+
+    def predict(self, df):
+        """
+        Make predictions on new data.
+        """
+        if self.model is None:
+            logging.error("Model is not loaded or trained.")
+            return None
+
+        # Predict using the AI model
+        predictions = self.model.predict_proba(df[AIConfig.FEATURES])
+        df["buy_signal"] = predictions[:, 1] >= AIConfig.THRESHOLD_BUY
+        df["sell_signal"] = predictions[:, 0] <= AIConfig.THRESHOLD_SELL
+
+        return df
+
+# Signal Generator
+class SignalGenerator:
+    @staticmethod
+    def generate_signals(df):
+        """
+        Generate trading signals based on AI predictions.
+        """
+        df["signal"] = np.where(df["RSI"] < 30, 1,  # Buy signal if RSI is below 30
+                                np.where(df["RSI"] > 70, -1, 0))  # Sell signal if RSI is above 70
+        logging.info("Trading signals generated.")
+        return df
+
+# Example Usage
+if __name__ == "__main__":
+    # Assume historical data is fetched and preprocessed from Part 2
+    from part2_data_pipeline import DataFetcher, DataPreprocessor
+    from part1_core_setup import CoinbaseAPI, Config
+
+    # Initialize APIs and fetch data
+    coinbase_api = CoinbaseAPI(Config.COINBASE_API_KEY, Config.COINBASE_SECRET_KEY)
+    fetcher = DataFetcher(coinbase_api)
+    preprocessor = DataPreprocessor()
+
+    historical_data = fetcher.fetch_historical_data(product_id="BTC-USD")
+    if not historical_data.empty:
+        processed_data = preprocessor.add_technical_indicators(historical_data)
+        processed_data = SignalGenerator.generate_signals(processed_data)
+
+        # Train or load the AI model
+        ai_model = AIModel()
+        ai_model.load_or_train_model(processed_data)
+
+        # Predict using the AI model
+        live_data = fetcher.fetch_live_data(product_id="BTC-USD")
+        if live_data is not None:
+            live_df = pd.DataFrame([{
+                "close": live_data,
+                "SMA_50": processed_data["SMA_50"].iloc[-1],
+                "SMA_200": processed_data["SMA_200"].iloc[-1],
+                "RSI": processed_data["RSI"].iloc[-1]
+            }])
+            predictions = ai_model.predict(live_df)
+            print(predictions)
+import logging
+
+# Decision-Making Configuration
+class DecisionConfig:
+    MAX_POSITION_SIZE = 0.1  # Maximum 10% of account balance per trade
+    RISK_REWARD_RATIO = 2.0  # Minimum reward-to-risk ratio
+    SLIPPAGE_TOLERANCE = 0.01  # 1% slippage tolerance
+    MAX_OPEN_TRADES = 5  # Maximum simultaneous open trades
+
+# Decision-Making Engine
+class DecisionEngine:
+    def __init__(self, account_balance, open_positions):
+        """
+        Initialize the Decision Engine.
+        :param account_balance: Total account balance.
+        :param open_positions: A list of open trades.
+        """
+        self.account_balance = account_balance
+        self.open_positions = open_positions
+
+    def calculate_position_size(self, risk_per_trade, stop_loss_level, entry_price):
+        """
+        Calculate the position size based on risk tolerance.
+        """
+        risk_amount = self.account_balance * risk_per_trade
+        position_size = risk_amount / abs(entry_price - stop_loss_level)
+        return min(position_size, self.account_balance * DecisionConfig.MAX_POSITION_SIZE)
+
+    def evaluate_trade(self, signal, entry_price, stop_loss, take_profit):
+        """
+        Evaluate if a trade should be executed.
+        :param signal: Buy or sell signal (1 for buy, -1 for sell, 0 for hold).
+        :param entry_price: Proposed trade entry price.
+        :param stop_loss: Proposed stop-loss level.
+        :param take_profit: Proposed take-profit level.
+        """
+        if signal == 1:  # Buy Signal
+            return self.evaluate_buy_trade(entry_price, stop_loss, take_profit)
+        elif signal == -1:  # Sell Signal
+            return self.evaluate_sell_trade(entry_price, stop_loss, take_profit)
+        else:
+            logging.info("No signal generated. Holding position.")
+            return None
+
+    def evaluate_buy_trade(self, entry_price, stop_loss, take_profit):
+        """
+        Evaluate a buy trade based on risk/reward and other factors.
+        """
+        if (take_profit - entry_price) / (entry_price - stop_loss) >= DecisionConfig.RISK_REWARD_RATIO:
+            position_size = self.calculate_position_size(
+                risk_per_trade=0.01,  # Risk 1% of balance per trade
+                stop_loss_level=stop_loss,
+                entry_price=entry_price
+            )
+            if len(self.open_positions) < DecisionConfig.MAX_OPEN_TRADES:
+                logging.info(f"Buy trade approved: Entry={entry_price}, SL={stop_loss}, TP={take_profit}, Size={position_size}")
+                return {"type": "buy", "size": position_size, "entry": entry_price, "stop_loss": stop_loss, "take_profit": take_profit}
+            else:
+                logging.warning("Max open trades reached. Cannot open new buy trade.")
+        else:
+            logging.info("Buy trade rejected due to insufficient risk/reward ratio.")
+        return None
+
+    def evaluate_sell_trade(self, entry_price, stop_loss, take_profit):
+        """
+        Evaluate a sell trade based on risk/reward and other factors.
+        """
+        if (entry_price - take_profit) / (stop_loss - entry_price) >= DecisionConfig.RISK_REWARD_RATIO:
+            position_size = self.calculate_position_size(
+                risk_per_trade=0.01,  # Risk 1% of balance per trade
+                stop_loss_level=stop_loss,
+                entry_price=entry_price
+            )
+            if len(self.open_positions) < DecisionConfig.MAX_OPEN_TRADES:
+                logging.info(f"Sell trade approved: Entry={entry_price}, SL={stop_loss}, TP={take_profit}, Size={position_size}")
+                return {"type": "sell", "size": position_size, "entry": entry_price, "stop_loss": stop_loss, "take_profit": take_profit}
+            else:
+                logging.warning("Max open trades reached. Cannot open new sell trade.")
+        else:
+            logging.info("Sell trade rejected due to insufficient risk/reward ratio.")
+        return None
+
+    def manage_open_positions(self, live_data):
+        """
+        Monitor and manage open positions.
+        :param live_data: Latest market price data.
+        """
+        for position in self.open_positions:
+            if position["type"] == "buy" and live_data["price"] >= position["take_profit"]:
+                logging.info(f"Closing buy position at take profit: {position['take_profit']}")
+                self.close_position(position)
+            elif position["type"] == "buy" and live_data["price"] <= position["stop_loss"]:
+                logging.info(f"Closing buy position at stop loss: {position['stop_loss']}")
+                self.close_position(position)
+            elif position["type"] == "sell" and live_data["price"] <= position["take_profit"]:
+                logging.info(f"Closing sell position at take profit: {position['take_profit']}")
+                self.close_position(position)
+            elif position["type"] == "sell" and live_data["price"] >= position["stop_loss"]:
+                logging.info(f"Closing sell position at stop loss: {position['stop_loss']}")
+                self.close_position(position)
+
+    def close_position(self, position):
+        """
+        Close a trade and remove it from the list of open positions.
+        """
+        self.open_positions.remove(position)
+        logging.info(f"Position closed: {position}")
+
+# Example Usage
+if __name__ == "__main__":
+    # Simulate live data and account balance
+    account_balance = 10000  # Example account balance
+    open_positions = []  # Start with no open trades
+    live_data = {"price": 50000}  # Example live price
+
+    # Initialize Decision Engine
+    decision_engine = DecisionEngine(account_balance, open_positions)
+
+    # Example signals and market data
+    trade_signal = 1  # Buy signal
+    entry_price = 50000
+    stop_loss = 49500
+    take_profit = 51000
+
+    # Evaluate a new trade
+    new_trade = decision_engine.evaluate_trade(trade_signal, entry_price, stop_loss, take_profit)
+    if new_trade:
+        open_positions.append(new_trade)  # Add the new trade to open positions
+        logging.info(f"Trade executed: {new_trade}")
+
+    # Manage open positions with live data
+    decision_engine.manage_open_positions(live_data)
+import logging
+import time
+from datetime import datetime
+
+# Trade Execution Configuration
+class ExecutionConfig:
+    SLIPPAGE_TOLERANCE = 0.01  # 1% slippage tolerance
+    RETRY_LIMIT = 3  # Retry order placement up to 3 times
+    ORDER_TIMEOUT = 5  # Timeout in seconds for order execution
+
+# Trade Executor
+class TradeExecutor:
+    def __init__(self, coinbase_api, rithmic_api):
+        """
+        Initialize TradeExecutor with API integrations.
+        :param coinbase_api: Instance of Coinbase API integration.
+        :param rithmic_api: Instance of Rithmic API integration.
+        """
+        self.coinbase_api = coinbase_api
+        self.rithmic_api = rithmic_api
+
+    def place_order(self, platform, order_type, size, price=None):
+        """
+        Place an order on the specified platform.
+        :param platform: Platform to execute the trade (e.g., 'coinbase', 'rithmic').
+        :param order_type: 'buy' or 'sell'.
+        :param size: Size of the order (amount to trade).
+        :param price: Limit price for the trade (optional for market orders).
+        """
+        for attempt in range(ExecutionConfig.RETRY_LIMIT):
+            try:
+                if platform == "coinbase":
+                    return self._place_coinbase_order(order_type, size, price)
+                elif platform == "rithmic":
+                    return self._place_rithmic_order(order_type, size, price)
+                else:
+                    logging.error(f"Unknown platform: {platform}")
+                    return None
+            except Exception as e:
+                logging.error(f"Error placing order (attempt {attempt + 1}): {e}")
+                time.sleep(ExecutionConfig.ORDER_TIMEOUT)
+        logging.error(f"Failed to place order after {ExecutionConfig.RETRY_LIMIT} attempts.")
+        return None
+
+    def _place_coinbase_order(self, order_type, size, price=None):
+        """
+        Execute an order through Coinbase API.
+        """
+        endpoint = "/orders"
+        order_data = {
+            "side": order_type,
+            "size": size,
+            "product_id": "BTC-USD",  # Example product
+            "type": "limit" if price else "market"
+        }
+        if price:
+            order_data["price"] = price
+
+        try:
+            response = self.coinbase_api.session.post(
+                f"{self.coinbase_api.base_url}{endpoint}",
+                json=order_data
+            )
+            response.raise_for_status()
+            order_response = response.json()
+            logging.info(f"Coinbase {order_type} order executed: {order_response}")
+            return order_response
+        except Exception as e:
+            logging.error(f"Error placing Coinbase order: {e}")
+            raise
+
+    def _place_rithmic_order(self, order_type, size, price=None):
+        """
+        Execute an order through Rithmic API.
+        """
+        endpoint = "/orders"
+        order_data = {
+            "side": order_type,
+            "size": size,
+            "symbol": "BTCUSD",  # Example product
+            "type": "limit" if price else "market"
+        }
+        if price:
+            order_data["price"] = price
+
+        try:
+            response = self.rithmic_api.session.post(
+                f"{self.rithmic_api.base_url}{endpoint}",
+                json=order_data
+            )
+            response.raise_for_status()
+            order_response = response.json()
+            logging.info(f"Rithmic {order_type} order executed: {order_response}")
+            return order_response
+        except Exception as e:
+            logging.error(f"Error placing Rithmic order: {e}")
+            raise
+
+    def monitor_order(self, platform, order_id):
+        """
+        Monitor an open order until it is filled, canceled, or times out.
+        :param platform: Platform where the order was placed.
+        :param order_id: ID of the order to monitor.
+        """
+        endpoint = f"/orders/{order_id}"
+        start_time = datetime.now()
+
+        while (datetime.now() - start_time).seconds < ExecutionConfig.ORDER_TIMEOUT:
+            try:
+                if platform == "coinbase":
+                    response = self.coinbase_api.session.get(f"{self.coinbase_api.base_url}{endpoint}")
+                elif platform == "rithmic":
+                    response = self.rithmic_api.session.get(f"{self.rithmic_api.base_url}{endpoint}")
+                else:
+                    logging.error(f"Unknown platform: {platform}")
+                    return None
+
+                response.raise_for_status()
+                order_status = response.json()
+                if order_status["status"] in ["filled", "canceled"]:
+                    logging.info(f"Order {order_id} {order_status['status']}.")
+                    return order_status
+                time.sleep(1)  # Poll every second
+            except Exception as e:
+                logging.error(f"Error monitoring order: {e}")
+                time.sleep(ExecutionConfig.ORDER_TIMEOUT)
+
+        logging.error(f"Order {order_id} monitoring timed out.")
+        return None
+
+# Example Usage
+if __name__ == "__main__":
+    from part1_core_setup import CoinbaseAPI, Config, RithmicAPI
+
+    # Initialize APIs
+    coinbase_api = CoinbaseAPI(Config.COINBASE_API_KEY, Config.COINBASE_SECRET_KEY)
+    rithmic_api = RithmicAPI(Config.RITHMIC_USERNAME, Config.RITHMIC_PASSWORD)
+
+    # Initialize TradeExecutor
+    trade_executor = TradeExecutor(coinbase_api, rithmic_api)
+
+    # Example Order
+    order = trade_executor.place_order(platform="coinbase", order_type="buy", size=0.01, price=50000)
+    if order:
+        logging.info(f"Order placed successfully: {order}")
+
+    # Monitor the order
+    if order:
+        trade_executor.monitor_order(platform="coinbase", order_id=order["id"])
+import logging
+
+# Risk Management Configuration
+class RiskConfig:
+    MAX_DAILY_LOSS = 0.05  # Max daily loss as a percentage of account balance (e.g., 5%)
+    MAX_POSITION_RISK = 0.01  # Risk per trade as a percentage of account balance (e.g., 1%)
+    MAX_POSITION_SIZE = 0.1  # Maximum position size as a fraction of account balance (e.g., 10%)
+    TRAILING_STOP_PERCENTAGE = 0.02  # Trailing stop loss as a percentage of entry price (e.g., 2%)
+
+# Risk Manager
+class RiskManager:
+    def __init__(self, account_balance):
+        """
+        Initialize RiskManager with account balance.
+        :param account_balance: Total account balance.
+        """
+        self.account_balance = account_balance
+        self.daily_loss = 0  # Track daily losses
+
+    def calculate_position_size(self, stop_loss, entry_price, risk_percentage=RiskConfig.MAX_POSITION_RISK):
+        """
+        Calculate position size based on risk and stop-loss level.
+        :param stop_loss: The stop-loss price.
+        :param entry_price: The trade entry price.
+        :param risk_percentage: The percentage of account balance to risk.
+        """
+        risk_amount = self.account_balance * risk_percentage
+        position_size = risk_amount / abs(entry_price - stop_loss)
+        max_position_size = self.account_balance * RiskConfig.MAX_POSITION_SIZE
+        return min(position_size, max_position_size)
+
+    def enforce_daily_loss_limit(self, trade_loss):
+        """
+        Enforce the daily loss limit.
+        :param trade_loss: Loss from the trade.
+        """
+        self.daily_loss += trade_loss
+        if self.daily_loss / self.account_balance >= RiskConfig.MAX_DAILY_LOSS:
+            logging.warning(f"Daily loss limit reached: {self.daily_loss / self.account_balance:.2%}")
+            return False
+        return True
+
+    def apply_trailing_stop(self, entry_price, current_price):
+        """
+        Apply a trailing stop loss to protect profits.
+        :param entry_price: The trade entry price.
+        :param current_price: The current market price.
+        """
+        trailing_stop = entry_price * (1 - RiskConfig.TRAILING_STOP_PERCENTAGE)
+        return max(trailing_stop, current_price)
+
+# Risk Integration with Trades
+class TradeRiskManager:
+    def __init__(self, account_balance):
+        self.risk_manager = RiskManager(account_balance)
+
+    def validate_trade(self, signal, entry_price, stop_loss, current_price):
+        """
+        Validate a trade based on risk management rules.
+        :param signal: Buy or sell signal (1 for buy, -1 for sell, 0 for hold).
+        :param entry_price: Proposed trade entry price.
+        :param stop_loss: Proposed stop-loss level.
+        :param current_price: Current market price.
+        """
+        if signal == 0:
+            logging.info("No trade signal detected. Skipping trade validation.")
+            return None
+
+        position_size = self.risk_manager.calculate_position_size(stop_loss, entry_price)
+        logging.info(f"Proposed position size: {position_size}")
+
+        # Ensure trade is within risk limits
+        if self.risk_manager.enforce_daily_loss_limit(trade_loss=abs(current_price - stop_loss)):
+            logging.info("Trade validated under daily loss limit.")
+            return {
+                "type": "buy" if signal == 1 else "sell",
+                "size": position_size,
+                "entry_price": entry_price,
+                "stop_loss": stop_loss,
+                "take_profit": entry_price * (1 + (RiskConfig.TRAILING_STOP_PERCENTAGE * 2))
+            }
+        else:
+            logging.warning("Trade rejected due to daily loss limit.")
+            return None
+
+# Example Usage
+if __name__ == "__main__":
+    # Simulate account balance and market data
+    account_balance = 10000  # Example account balance
+    current_price = 50000  # Example current market price
+    entry_price = 50000  # Example trade entry price
+    stop_loss = 49500  # Example stop-loss level
+    signal = 1  # Buy signal
+
+    # Initialize Risk Manager
+    trade_risk_manager = TradeRiskManager(account_balance)
+
+    # Validate trade
+    trade = trade_risk_manager.validate_trade(signal, entry_price, stop_loss, current_price)
+    if trade:
+        logging.info(f"Trade approved: {trade}")
+    else:
+        logging.warning("Trade rejected by Risk Manager.")
+import logging
+from datetime import datetime
+
+# Performance Monitoring Configuration
+class PerformanceConfig:
+    LOG_INTERVAL = 60  # Log performance metrics every 60 seconds
+    ALERT_THRESHOLD_PROFIT = 0.1  # 10% profit of account balance triggers an alert
+    ALERT_THRESHOLD_LOSS = 0.05  # 5% loss of account balance triggers an alert
+
+# Performance Tracker
+class PerformanceTracker:
+    def __init__(self, account_balance):
+        """
+        Initialize Performance Tracker.
+        :param account_balance: Total account balance.
+        """
+        self.initial_balance = account_balance
+        self.current_balance = account_balance
+        self.total_profit = 0
+        self.total_loss = 0
+        self.trades_executed = 0
+        self.successful_trades = 0
+        self.failed_trades = 0
+        self.logs = []
+
+    def update_balance(self, new_balance):
+        """
+        Update the account balance and calculate profit/loss.
+        """
+        profit_or_loss = new_balance - self.current_balance
+        self.current_balance = new_balance
+        if profit_or_loss > 0:
+            self.total_profit += profit_or_loss
+            self.successful_trades += 1
+        else:
+            self.total_loss += abs(profit_or_loss)
+            self.failed_trades += 1
+        self.trades_executed += 1
+        logging.info(f"Account balance updated: {self.current_balance}")
+
+    def log_performance(self):
+        """
+        Log performance metrics at regular intervals.
+        """
+        performance_summary = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "initial_balance": self.initial_balance,
+            "current_balance": self.current_balance,
+            "total_profit": self.total_profit,
+            "total_loss": self.total_loss,
+            "trades_executed": self.trades_executed,
+            "successful_trades": self.successful_trades,
+            "failed_trades": self.failed_trades,
+            "win_rate": (self.successful_trades / self.trades_executed) * 100 if self.trades_executed > 0 else 0,
+        }
+        self.logs.append(performance_summary)
+        logging.info(f"Performance Summary: {performance_summary}")
+
+    def generate_alerts(self):
+        """
+        Generate alerts for significant events (e.g., large profit/loss).
+        """
+        profit_percentage = (self.current_balance - self.initial_balance) / self.initial_balance
+        if profit_percentage >= PerformanceConfig.ALERT_THRESHOLD_PROFIT:
+            logging.warning(f"High profit alert: {profit_percentage:.2%}")
+        elif profit_percentage <= -PerformanceConfig.ALERT_THRESHOLD_LOSS:
+            logging.warning(f"High loss alert: {profit_percentage:.2%}")
+
+# Performance Dashboard
+class PerformanceDashboard:
+    def __init__(self, tracker):
+        """
+        Initialize the Performance Dashboard.
+        :param tracker: Instance of PerformanceTracker.
+        """
+        self.tracker = tracker
+
+    def display_dashboard(self):
+        """
+        Display performance metrics in a user-friendly format.
+        """
+        logging.info("======== Performance Dashboard ========")
+        logging.info(f"Initial Balance: {self.tracker.initial_balance}")
+        logging.info(f"Current Balance: {self.tracker.current_balance}")
+        logging.info(f"Total Profit: {self.tracker.total_profit}")
+        logging.info(f"Total Loss: {self.tracker.total_loss}")
+        logging.info(f"Trades Executed: {self.tracker.trades_executed}")
+        logging.info(f"Successful Trades: {self.tracker.successful_trades}")
+        logging.info(f"Failed Trades: {self.tracker.failed_trades}")
+        logging.info(f"Win Rate: {self.tracker.successful_trades / self.tracker.trades_executed * 100 if self.tracker.trades_executed > 0 else 0:.2f}%")
+        logging.info("=======================================")
+
+# Example Usage
+if __name__ == "__main__":
+    # Simulate account balance updates and performance monitoring
+    initial_balance = 10000  # Example initial balance
+    tracker = PerformanceTracker(initial_balance)
+
+    # Simulated trade outcomes
+    trade_outcomes = [10200, 9800, 10500, 9700, 11000]  # Simulated balances after trades
+
+    for new_balance in trade_outcomes:
+        tracker.update_balance(new_balance)
+        tracker.log_performance()
+        tracker.generate_alerts()
+
+    # Display final dashboard
+    dashboard = PerformanceDashboard(tracker)
+    dashboard.display_dashboard()
+import logging
+import time
+from part1_core_setup import Config, CoinbaseAPI, RithmicAPI
+from part2_data_pipeline import DataFetcher, DataPreprocessor
+from part3_ai_model import AIModel, SignalGenerator
+from part4_decision_engine import DecisionEngine
+from part5_trade_execution import TradeExecutor
+from part6_risk_management import TradeRiskManager
+from part7_performance_monitoring import PerformanceTracker, PerformanceDashboard
+
+# Unified Trading Bot
+class TradingBot:
+    def __init__(self, config):
+        """
+        Initialize the Trading Bot with all components.
+        """
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+        # Configuration
+        self.config = config
+
+        # APIs
+        self.coinbase_api = CoinbaseAPI(config.COINBASE_API_KEY, config.COINBASE_SECRET_KEY)
+        self.rithmic_api = RithmicAPI(config.RITHMIC_USERNAME, config.RITHMIC_PASSWORD)
+
+        # Modules
+        self.data_fetcher = DataFetcher(self.coinbase_api)
+        self.data_preprocessor = DataPreprocessor()
+        self.ai_model = AIModel()
+        self.decision_engine = DecisionEngine(account_balance=config.ACCOUNT_BALANCE, open_positions=[])
+        self.trade_executor = TradeExecutor(self.coinbase_api, self.rithmic_api)
+        self.risk_manager = TradeRiskManager(account_balance=config.ACCOUNT_BALANCE)
+        self.performance_tracker = PerformanceTracker(account_balance=config.ACCOUNT_BALANCE)
+        self.performance_dashboard = PerformanceDashboard(self.performance_tracker)
+
+    def fetch_and_process_data(self, product_id):
+        """
+        Fetch live data and preprocess it for AI prediction.
+        """
+        live_data = self.data_fetcher.fetch_live_data(product_id)
+        historical_data = self.data_fetcher.fetch_historical_data(product_id)
+        if historical_data.empty or live_data is None:
+            logging.warning("No data fetched. Skipping this cycle.")
+            return None
+
+        processed_data = self.data_preprocessor.add_technical_indicators(historical_data)
+        processed_data = SignalGenerator.generate_signals(processed_data)
+        return live_data, processed_data
+
+    def execute_trading_cycle(self, product_id):
+        """
+        Execute one full trading cycle: fetch data, predict signals, decide trades, execute, and monitor.
+        """
+        # Fetch and preprocess data
+        live_data, processed_data = self.fetch_and_process_data(product_id)
+        if live_data is None or processed_data is None:
+            return
+
+        # Generate AI predictions
+        self.ai_model.load_or_train_model(processed_data)
+        predictions = self.ai_model.predict(processed_data)
+
+        # Evaluate trading signals
+        trade_signal = predictions.iloc[-1]["signal"]
+        entry_price = live_data["price"]
+        stop_loss = entry_price * (1 - 0.01)  # Example: 1% stop loss
+        take_profit = entry_price * (1 + 0.02)  # Example: 2% take profit
+
+        trade = self.risk_manager.validate_trade(
+            signal=trade_signal,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            current_price=entry_price,
+        )
+
+        # Execute trade if validated
+        if trade:
+            platform = "coinbase"  # Default to Coinbase for now
+            order = self.trade_executor.place_order(
+                platform=platform,
+                order_type=trade["type"],
+                size=trade["size"],
+                price=trade["entry_price"],
+            )
+            if order:
+                logging.info(f"Order executed successfully: {order}")
+                self.performance_tracker.update_balance(trade["take_profit"])  # Simulate P&L update
+
+        # Monitor performance
+        self.performance_tracker.log_performance()
+        self.performance_tracker.generate_alerts()
+
+    def run(self, product_id, interval=60):
+        """
+        Run the trading bot continuously.
+        """
+        logging.info("Starting trading bot...")
+        while True:
+            try:
+                self.execute_trading_cycle(product_id)
+                self.performance_dashboard.display_dashboard()
+                time.sleep(interval)
+            except KeyboardInterrupt:
+                logging.info("Stopping trading bot.")
+                break
+            except Exception as e:
+                logging.error(f"Error in trading cycle: {e}")
+                time.sleep(interval)
+
+# Main Execution
+if __name__ == "__main__":
+    # Load configuration
+    config = Config(
+        COINBASE_API_KEY="your_coinbase_api_key",
+        COINBASE_SECRET_KEY="your_coinbase_secret_key",
+        RITHMIC_USERNAME="your_rithmic_username",
+        RITHMIC_PASSWORD="your_rithmic_password",
+        ACCOUNT_BALANCE=10000,  # Example account balance
+    )
+
+    # Initialize and start the bot
+    trading_bot = TradingBot(config)
+    trading_bot.run(product_id="BTC-USD", interval=60)  # Run on BTC-USD with 60-second intervals
+import logging
+import os
+from cryptography.fernet import Fernet
+
+# Security Configuration
+class SecurityConfig:
+    ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY")  # Load key from environment variable
+    if not ENCRYPTION_KEY:
+        ENCRYPTION_KEY = Fernet.generate_key().decode()
+        os.environ["ENCRYPTION_KEY"] = ENCRYPTION_KEY
+
+    API_KEYS = ["COINBASE_API_KEY", "COINBASE_SECRET_KEY", "RITHMIC_USERNAME", "RITHMIC_PASSWORD"]
+
+# Security Manager
+class SecurityManager:
+    def __init__(self):
+        self.cipher = Fernet(SecurityConfig.ENCRYPTION_KEY.encode())
+
+    def encrypt(self, data):
+        """
+        Encrypt sensitive data.
+        :param data: Data to encrypt.
+        """
+        return self.cipher.encrypt(data.encode()).decode()
+
+    def decrypt(self, encrypted_data):
+        """
+        Decrypt sensitive data.
+        :param encrypted_data: Data to decrypt.
+        """
+        return self.cipher.decrypt(encrypted_data.encode()).decode()
+
+    def save_encrypted_credentials(self, credentials, file_path="credentials.enc"):
+        """
+        Save encrypted credentials to a file.
+        :param credentials: Dictionary of credentials to encrypt.
+        :param file_path: File path to save encrypted data.
+        """
+        encrypted_credentials = {key: self.encrypt(value) for key, value in credentials.items()}
+        with open(file_path, "w") as file:
+            for key, value in encrypted_credentials.items():
+                file.write(f"{key}={value}\n")
+        logging.info("Credentials saved securely.")
+
+    def load_encrypted_credentials(self, file_path="credentials.enc"):
+        """
+        Load and decrypt credentials from a file.
+        :param file_path: File path to read encrypted data.
+        """
+        credentials = {}
+        with open(file_path, "r") as file:
+            for line in file:
+                key, encrypted_value = line.strip().split("=")
+                credentials[key] = self.decrypt(encrypted_value)
+        logging.info("Credentials loaded securely.")
+        return credentials
+
+# Compliance Manager
+class ComplianceManager:
+    def __init__(self):
+        self.logs = []
+
+    def audit_trade(self, trade_data):
+        """
+        Log and audit every trade for compliance.
+        :param trade_data: Dictionary containing trade details.
+        """
+        audit_log = {
+            "timestamp": trade_data.get("timestamp"),
+            "platform": trade_data.get("platform"),
+            "type": trade_data.get("type"),
+            "size": trade_data.get("size"),
+            "price": trade_data.get("price"),
+            "status": trade_data.get("status"),
+        }
+        self.logs.append(audit_log)
+        logging.info(f"Trade audited: {audit_log}")
+
+    def generate_report(self, report_path="compliance_report.log"):
+        """
+        Generate a compliance report for all trades.
+        :param report_path: File path to save the report.
+        """
+        with open(report_path, "w") as file:
+            for log in self.logs:
+                file.write(f"{log}\n")
+        logging.info(f"Compliance report generated: {report_path}")
+
+# Example Usage
+if __name__ == "__main__":
+    # Initialize Security Manager
+    security_manager = SecurityManager()
+
+    # Encrypt and save credentials
+    credentials = {
+        "COINBASE_API_KEY": "your_coinbase_api_key",
+        "COINBASE_SECRET_KEY": "your_coinbase_secret_key",
+        "RITHMIC_USERNAME": "your_rithmic_username",
+        "RITHMIC_PASSWORD": "your_rithmic_password",
+    }
+    security_manager.save_encrypted_credentials(credentials)
+
+    # Load and decrypt credentials
+    decrypted_credentials = security_manager.load_encrypted_credentials()
+
+    # Initialize Compliance Manager
+    compliance_manager = ComplianceManager()
+
+    # Simulate a trade audit
+    trade_data = {
+        "timestamp": "2024-12-06T18:00:00Z",
+        "platform": "coinbase",
+        "type": "buy",
+        "size": 0.1,
+        "price": 50000,
+        "status": "filled",
+    }
+    compliance_manager.audit_trade(trade_data)
+
+    # Generate compliance report
+    compliance_manager.generate_report()
+import logging
+import time
+from datetime import datetime
+from part1_core_setup import Config
+from part8_full_integration import TradingBot
+from part9_security_compliance import ComplianceManager
+
+# Test and Deployment Configuration
+class TestConfig:
+    SIMULATION_MODE = True  # Enable simulation for testing
+    TEST_PRODUCTS = ["BTC-USD", "ETH-USD"]  # Assets to test with
+    TEST_INTERVAL = 30  # Run trading cycles every 30 seconds during testing
+
+# Tester
+class BotTester:
+    def __init__(self, trading_bot, compliance_manager, config):
+        """
+        Initialize BotTester with trading bot and compliance tools.
+        """
+        self.trading_bot = trading_bot
+        self.compliance_manager = compliance_manager
+        self.config = config
+
+    def simulate_trade_cycle(self, product_id):
+        """
+        Simulate one trading cycle in a sandbox environment.
+        """
+        try:
+            logging.info(f"Starting simulation for {product_id}")
+            self.trading_bot.execute_trading_cycle(product_id)
+        except Exception as e:
+            logging.error(f"Simulation error: {e}")
+
+    def run_tests(self):
+        """
+        Run multiple test cycles for validation.
+        """
+        for product_id in TestConfig.TEST_PRODUCTS:
+            for _ in range(3):  # Run 3 test cycles for each product
+                self.simulate_trade_cycle(product_id)
+                time.sleep(TestConfig.TEST_INTERVAL)
+
+# Deployment Manager
+class DeploymentManager:
+    def __init__(self, trading_bot):
+        """
+        Initialize Deployment Manager.
+        """
+        self.trading_bot = trading_bot
+
+    def deploy(self, product_id, interval=60):
+        """
+        Deploy the bot for live trading.
+        """
+        logging.info(f"Deploying bot for live trading on {product_id}")
+        try:
+            self.trading_bot.run(product_id=product_id, interval=interval)
+        except KeyboardInterrupt:
+            logging.info("Stopping live trading bot.")
+        except Exception as e:
+            logging.error(f"Deployment error: {e}")
+
+# Example Usage
+if __name__ == "__main__":
+    # Step 1: Load Configuration
+    config = Config(
+        COINBASE_API_KEY="your_coinbase_api_key",
+        COINBASE_SECRET_KEY="your_coinbase_secret_key",
+        RITHMIC_USERNAME="your_rithmic_username",
+        RITHMIC_PASSWORD="your_rithmic_password",
+        ACCOUNT_BALANCE=10000,  # Example initial balance
+    )
+
+    # Step 2: Initialize Bot Components
+    trading_bot = TradingBot(config)
+    compliance_manager = ComplianceManager()
+
+    # Step 3: Run Tests
+    logging.info("Running tests...")
+    bot_tester = BotTester(trading_bot, compliance_manager, config)
+    bot_tester.run_tests()
+
+    # Step 4: Deploy Bot for Live Trading
+    logging.info("Deploying bot...")
+    deployment_manager = DeploymentManager(trading_bot)
+    deployment_manager.deploy(product_id="BTC-USD", interval=60)  # Run on BTC-USD with 60-second intervals
