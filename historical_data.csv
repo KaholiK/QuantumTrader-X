@@ -1,0 +1,81 @@
+import yfinance as yf
+import requests
+import pandas as pd
+import ta  # Technical Analysis library
+
+# Fetch Historical Data (Yahoo Finance)
+def fetch_yahoo_data(assets):
+    for asset in assets:
+        print(f"Fetching data for {asset} from Yahoo Finance...")
+        data = yf.download(asset, start="2020-01-01", end="2023-01-01")
+        data['asset'] = asset  # Add asset identifier
+        data.reset_index(inplace=True)
+        data.to_csv(f"{asset}_data.csv", index=False)
+        print(f"{asset} data saved to {asset}_data.csv")
+
+# Fetch Crypto Data (CoinGecko)
+def fetch_crypto_data(coin_id, currency="usd"):
+    print(f"Fetching data for {coin_id} from CoinGecko...")
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {"vs_currency": currency, "days": "max"}
+    response = requests.get(url, params=params)
+    data = response.json()
+    prices = pd.DataFrame(data['prices'], columns=['timestamp', 'price'])
+    prices['timestamp'] = pd.to_datetime(prices['timestamp'], unit='ms')
+    prices.to_csv(f"{coin_id}_data.csv", index=False)
+    print(f"{coin_id} data saved to {coin_id}_data.csv")
+
+# Preprocess Kaggle or Other Historical Data
+def preprocess_kaggle_data(file_path, output_path):
+    print(f"Preprocessing data from {file_path}...")
+    kaggle_data = pd.read_csv(file_path)
+    
+    # Add RSI
+    kaggle_data['RSI'] = kaggle_data['close'].rolling(window=14).apply(
+        lambda x: 100 - (100 / (1 + (x.diff().clip(lower=0).mean() / -x.diff().clip(upper=0).mean())))
+    )
+    # Add MACD
+    kaggle_data['MACD'] = kaggle_data['close'].ewm(span=12).mean() - kaggle_data['close'].ewm(span=26).mean()
+
+    kaggle_data.to_csv(output_path, index=False)
+    print(f"Preprocessed data saved to {output_path}")
+
+# Dynamic Feature Engineering for Technical Indicators
+def feature_engineering(file_path, output_path):
+    print(f"Applying feature engineering to {file_path}...")
+    data = pd.read_csv(file_path)
+
+    # Compute RSI
+    data['RSI'] = ta.momentum.RSIIndicator(close=data['price']).rsi()
+    # Compute MACD
+    data['MACD'] = ta.trend.MACD(close=data['price']).macd_diff()
+    # Compute Bollinger Bands
+    bollinger = ta.volatility.BollingerBands(close=data['price'])
+    data['BB_upper'] = bollinger.bollinger_hband()
+    data['BB_lower'] = bollinger.bollinger_lband()
+
+    data.to_csv(output_path, index=False)
+    print(f"Feature-engineered data saved to {output_path}")
+
+# Main Function
+def main():
+    # Assets to fetch
+    assets = ["AAPL", "TSLA", "BTC-USD", "ETH-USD"]
+    
+    # Fetch Yahoo Finance data
+    fetch_yahoo_data(assets)
+    
+    # Fetch CoinGecko data
+    fetch_crypto_data("bitcoin")
+    fetch_crypto_data("ethereum")
+    
+    # Preprocess Kaggle dataset (replace with your file path)
+    preprocess_kaggle_data("kaggle_dataset.csv", "processed_kaggle_data.csv")
+    
+    # Feature engineering on fetched data
+    feature_engineering("BTC_data.csv", "BTC_with_features.csv")
+    feature_engineering("ETH_data.csv", "ETH_with_features.csv")
+
+# Run the main function
+if __name__ == "__main__":
+    main()
